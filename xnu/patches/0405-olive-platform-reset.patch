@@ -1,0 +1,396 @@
+diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
+index 8933fb4..8f819a4 100644
+--- a/bsd/dev/sweet_perf.c
++++ b/bsd/dev/sweet_perf.c
+@@ -37,6 +37,8 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ #define SWEET_IMEM_BASE 0x146bf000UL	/* taimen qcom,msm-imem; restart_reason at +0x65c */
++#elif defined(ARM64_BOARD_CONFIG_OLIVE)
++#define SWEET_IMEM_BASE 0x08600000UL	/* olive qcom,msm-imem; restart_reason at +0x65c */
+ #else
+ #define SWEET_IMEM_BASE 0x066bf000UL
+ #endif
+@@ -251,7 +253,7 @@ perf_turbo(vm_offset_t apc0, vm_offset_t apc1, vm_offset_t cbf, vm_offset_t cbfp
+ 	printf("SWEET CLK: cbf mux=%#x pll mode=%#x l=%u\n", clk_rd(cbf, 0x18), clk_rd(cbfpll, 0), clk_rd(cbfpll, 8));
+ }
+ 
+-static void __attribute__((unused))     /* not called on taimen */
++static void __attribute__((unused))     /* not called on taimen or olive */
+ perf_clocks(void)
+ {
+ 	vm_offset_t apc0 = ml_io_map(CLK_APC0_PA, 0x1000), apc1 = ml_io_map(CLK_APC1_PA, 0x1000);
+@@ -1626,7 +1628,9 @@ perf_thread(void *arg, wait_result_t result)
+ {
+ 	(void)arg;
+ 	(void)result;
+-#if !defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++	/* olive (0405): no clock work; the MSM8996 and MSM8998 clock MMIO below is not SDM439's. */
++#elif !defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 	/* MSM8996 clock and debug-mux addresses: none of this is right on taimen (0222). */
+ 	perf_clocks();
+ 	/*
+@@ -1675,7 +1679,7 @@ perf_thread(void *arg, wait_result_t result)
+ 		    ms ? ds * 1000 / ms : 0, ms ? ds * 10000 / ms % 10 : 0,
+ 		    ms ? dp * 1000 / ms : 0, ms ? dp * 10000 / ms % 10 : 0,
+ 		    dp ? perf_ns(dabs) / 1000 / dp : 0);
+-#if !defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if !defined(ARM64_BOARD_CONFIG_TAIMEN) && !defined(ARM64_BOARD_CONFIG_OLIVE)
+ 		uint64_t bimc = clk_measure_mhz(0xad);
+ 		printf("SWEET PERF: bimc %llu MHz (DDR %llu MHz)\n", bimc, bimc * 2);
+ #endif
+diff --git a/iokit/Kernel/IOPlatformExpert.cpp b/iokit/Kernel/IOPlatformExpert.cpp
+index 7a32a23..7fe4c60 100644
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -334,6 +334,10 @@ IOPlatformExpert::getPhysicalRangeAllocator(void)
+ }
+ 
+ int (*PE_halt_restart)(unsigned int type) = NULL;
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++/* olive: a panic or reboot before SweetPlatformExpert hooks PE_halt_restart drops PS_HOLD (0405) */
++extern "C" int olive_early_halt_restart(unsigned int type);
++#endif
+ 
+ int
+ IOPlatformExpert::haltRestart(unsigned int type)
+@@ -363,7 +367,11 @@ IOPlatformExpert::haltRestart(unsigned int type)
+ 	if (PE_halt_restart) {
+ 		return (*PE_halt_restart)(type);
+ 	} else {
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++		return olive_early_halt_restart(type);
++#else
+ 		return -1;
++#endif
+ 	}
+ }
+ 
+@@ -1097,7 +1105,12 @@ skip_to_haltRestart:
+ 		// Implementors of this function will check the type and take action accordingly
+ 		return gIOPlatform->haltRestart(type);
+ 	} else {
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++		/* before IOKit: PS_HOLD through the early alias (SweetPlatformExpert.cpp, 0405) */
++		return olive_early_halt_restart(type);
++#else
+ 		return -1;
++#endif
+ 	}
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 8eb9c12..a0fa01b 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -14,6 +14,9 @@
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ static int taimen_halt_restart(unsigned int type);
+ #endif
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++#include <kern/thread.h>
++#endif
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -390,9 +393,299 @@ taimen_halt_restart(unsigned int type __unused)
+ }
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++/*
++ * olive: restart through PS_HOLD (DT restart@4ab000, qcom,pshold, with
++ * qcom,force-warm-reboot), ported from onclite 0105 (same PM8953 PMIC, same
++ * CAF msm8953 LK). Dropping PS_HOLD makes the PMIC reset the SoC; with the
++ * PON PS_HOLD reset type at warm, DRAM is kept, so the ramoops console at
++ * 0x9ff00000 survives for the Android side to read. PSCI SYSTEM_RESET is not
++ * used: probe v1 called it before PS_HOLD, so it is unproven here.
++ *
++ * LK reads its boot mode from PON SOFT_RB_SPARE (0x88f bits 7:2, LK
++ * USE_PON_REBOOT_REG: 1 recovery, 2 fastboot), not from the IMEM reason
++ * (onclite C7, olive probe v1: IMEM alone landed in Lineage). Default
++ * recovery: once userdata holds the iOS root a normal Lineage boot must never
++ * run (its fstab marks /data formattable). LK leaves the PS_HOLD reset type
++ * at DVDD hard (8), which does not keep SOFT_RB_SPARE, so the type goes to
++ * warm first, as Linux qpnp_pon_reset_config() does. The PON writes are
++ * polled SPMI commands through the PMIC arbiter v2 (Linux spmi-pmic-arb.c),
++ * EE 0; the IMEM restart_reason is written too (harmless, for LKs that use it).
++ *
++ * Boot-args: olive_reset_to=normal|recovery|fastboot (default recovery),
++ * olive_reboot_after=N restarts N seconds after the platform expert starts,
++ * for unattended tests. Panics reach this with debug= DB_REBOOT_ALWAYS
++ * (0x100000), or with a value without DB_NMI (0x4).
++ *
++ * Before this platform expert starts there is no IOKit and no ml_io_map in
++ * panic context: olive_early_halt_restart (IOPlatformExpert.cpp) can only
++ * drop PS_HOLD through the alias sweet_early_relocate set up (0402), and the
++ * boot mode is whatever the shim pre-set (SH-1b) left in the PON.
++ */
++#define OLIVE_IMEM_PA           0x08600000UL    /* qcom,msm-imem */
++#define OLIVE_IMEM_RESTART_REASON 0x65c
++#define OLIVE_SPMI_CORE_PA      0x0200f000UL    /* reg-names core, chnls, obsrvr, cnfg */
++#define OLIVE_SPMI_CHNLS_PA     0x02400000UL
++#define OLIVE_SPMI_OBSRVR_PA    0x02c00000UL
++#define OLIVE_SPMI_CNFG_PA      0x0200a000UL
++#define OLIVE_SPMI_APID_MAP(n)  (0x800 + 4 * (n))
++#define OLIVE_SPMI_OWNER(n)     (0x700 + 4 * (n))
++#define OLIVE_SPMI_CHNL_STRIDE  0x8000
++#define OLIVE_SPMI_CMD          0x00
++#define OLIVE_SPMI_STATUS       0x08
++#define OLIVE_SPMI_WDATA0       0x10
++#define OLIVE_SPMI_RDATA0       0x18
++#define OLIVE_SPMI_OP_WRITEL    0u
++#define OLIVE_SPMI_OP_READL     1u
++#define OLIVE_PON_PPID          0x008           /* PM8953 SID 0, peripheral 0x08 (qcom,power-on@800) */
++#define OLIVE_PON_SOFT_RB_SPARE 0x8f
++#define OLIVE_PON_PS_HOLD_RESET_CTL  0x5a       /* [3:0] type: 1 warm, 7 hard, 8 DVDD hard (LK) */
++#define OLIVE_PON_PS_HOLD_RESET_CTL2 0x5b       /* bit 7: enable */
++#define OLIVE_PON_RESET_TYPE_WARM 1
++#define OLIVE_PON_RESET_EN      0x80
++#define OLIVE_LK_NORMAL         0
++#define OLIVE_LK_RECOVERY       1
++#define OLIVE_LK_FASTBOOT       2
++#define OLIVE_RB_QUICK          0x400           /* bsd/sys/reboot.h RB_QUICK */
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" int reboot_kernel(int howto, char *message);
++extern "C" volatile uint32_t *olive_early_pshold;      /* osfmk/arm64/sweet_early.c (0402) */
++extern "C" int olive_early_halt_restart(unsigned int type);
++
++static volatile uint32_t *olive_pshold;                 /* mapped in start(); panic context must not map */
++static volatile uint32_t *olive_imem_reason;
++static vm_offset_t olive_spmi_chnl, olive_spmi_obsrvr;  /* the PON channel's write/read windows */
++static uint32_t olive_reset_mode = OLIVE_LK_RECOVERY;
++
++/* LK (msm8953 target) IMEM reasons: what Linux msm-poweroff writes. */
++static const uint32_t olive_imem_reasons[] = { 0x77665501, 0x77665502, 0x77665500 };
++static const char *const olive_mode_names[] = { "normal", "recovery", "fastboot" };
++
++/* Types that are only notifications, not a request to go down. */
++static bool
++olive_restart_type(unsigned int type)
++{
++	return type != kPEPanicSync && type != kPEPanicBegin && type != kPEPanicEnd &&
++	       type != kPEPanicDiagnosticsDone && type != kPEPanicDiagnosticsInProgress &&
++	       type != kPEHangCPU;
++}
++
++static __attribute__((noreturn)) void
++olive_pshold_drop(volatile uint32_t *pshold)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	*pshold = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++	for (;;) {
++		__asm__ volatile("wfi");
++	}
++}
++
++static int
++olive_spmi_wait(vm_offset_t window)
++{
++	for (int i = 0; i < 10000; i++) {
++		uint32_t st = *(volatile uint32_t *)(window + OLIVE_SPMI_STATUS);
++		if (st & 1) {
++			return (st & 0xe) ? (int)st : 0;   /* failure, denied, dropped */
++		}
++		IODelay(1);
++	}
++	return -1;
++}
++
++static int
++olive_pon_read(uint8_t reg, uint8_t *value)
++{
++	if (!olive_spmi_obsrvr) {
++		return -1;
++	}
++	*(volatile uint32_t *)(olive_spmi_obsrvr + OLIVE_SPMI_CMD) = (OLIVE_SPMI_OP_READL << 27) | ((uint32_t)reg << 4);
++	int rc = olive_spmi_wait(olive_spmi_obsrvr);
++	if (!rc) {
++		*value = (uint8_t)*(volatile uint32_t *)(olive_spmi_obsrvr + OLIVE_SPMI_RDATA0);
++	}
++	return rc;
++}
++
++static int
++olive_pon_write(uint8_t reg, uint8_t value)
++{
++	if (!olive_spmi_chnl) {
++		return -1;
++	}
++	*(volatile uint32_t *)(olive_spmi_chnl + OLIVE_SPMI_WDATA0) = value;
++	*(volatile uint32_t *)(olive_spmi_chnl + OLIVE_SPMI_CMD) = (OLIVE_SPMI_OP_WRITEL << 27) | ((uint32_t)reg << 4);
++	return olive_spmi_wait(olive_spmi_chnl);
++}
++
++/*
++ * PS_HOLD reset type warm (DT force-warm-reboot): disable, wait 10 sleep
++ * clock cycles (32 kHz: ~300 us; 500 like 0105), set the type, enable.
++ */
++static int
++olive_pon_warm_reset(uint8_t *ctl_out)
++{
++	uint8_t ctl = 0;
++	int rc = olive_pon_read(OLIVE_PON_PS_HOLD_RESET_CTL, &ctl);
++	if (!rc && (ctl & 0xf) == OLIVE_PON_RESET_TYPE_WARM) {
++		*ctl_out = ctl;                 /* the shim (SH-1b) or an earlier try set it */
++		return 0;
++	}
++	if (!rc) {
++		rc = olive_pon_write(OLIVE_PON_PS_HOLD_RESET_CTL2, 0);
++	}
++	if (!rc) {
++		IODelay(500);
++		rc = olive_pon_write(OLIVE_PON_PS_HOLD_RESET_CTL, (uint8_t)((ctl & ~0xf) | OLIVE_PON_RESET_TYPE_WARM));
++	}
++	if (!rc) {
++		rc = olive_pon_write(OLIVE_PON_PS_HOLD_RESET_CTL2, OLIVE_PON_RESET_EN);
++	}
++	if (!rc) {
++		rc = olive_pon_read(OLIVE_PON_PS_HOLD_RESET_CTL, &ctl);
++	}
++	*ctl_out = ctl;
++	return rc;
++}
++
++/* Find the PON channel (APID with PPID 0x008, owned by EE 0) and map its windows. */
++static void
++olive_spmi_init(void)
++{
++	vm_offset_t core = ml_io_map(OLIVE_SPMI_CORE_PA, 0x1000);
++	vm_offset_t cnfg = ml_io_map(OLIVE_SPMI_CNFG_PA, 0x1000);
++	if (!core || !cnfg) {
++		IOLog("OLIVE RESET: SPMI mapping failed\n");
++		return;
++	}
++	for (uint32_t apid = 0; OLIVE_SPMI_APID_MAP(apid) < 0x1000; apid++) {
++		uint32_t map = *(volatile uint32_t *)(core + OLIVE_SPMI_APID_MAP(apid));
++		if (map == 0 || ((map >> 8) & 0xfff) != OLIVE_PON_PPID) {
++			continue;
++		}
++		uint32_t owner = *(volatile uint32_t *)(cnfg + OLIVE_SPMI_OWNER(apid)) & 7;
++		IOLog("OLIVE RESET: SPMI PON is channel %u (owner EE %u)\n", apid, owner);
++		if (owner != 0) {
++			return;
++		}
++		olive_spmi_chnl = ml_io_map(OLIVE_SPMI_CHNLS_PA + OLIVE_SPMI_CHNL_STRIDE * apid, 0x1000);
++		olive_spmi_obsrvr = ml_io_map(OLIVE_SPMI_OBSRVR_PA + OLIVE_SPMI_CHNL_STRIDE * apid, 0x1000);
++		return;
++	}
++	IOLog("OLIVE RESET: SPMI PON channel not found\n");
++}
++
++static int
++olive_halt_restart(unsigned int type)
++{
++	if (!olive_restart_type(type) || olive_pshold == NULL) {
++		return 0;
++	}
++	uint8_t spare = 0, ctl = 0, check = 0;
++	int rc = olive_pon_warm_reset(&ctl);
++	if (!rc) {
++		rc = olive_pon_read(OLIVE_PON_SOFT_RB_SPARE, &spare);
++	}
++	if (!rc) {
++		rc = olive_pon_write(OLIVE_PON_SOFT_RB_SPARE, (uint8_t)((spare & 3) | (olive_reset_mode << 2)));
++	}
++	if (!rc) {
++		rc = olive_pon_read(OLIVE_PON_SOFT_RB_SPARE, &check);
++	}
++	if (olive_imem_reason != NULL) {
++		*olive_imem_reason = olive_imem_reasons[olive_reset_mode];
++	}
++	/*
++	 * Logged even when the PON writes failed: PS_HOLD drops anyway, and the
++	 * shim's pre-set (SH-1b) is what keeps that reset out of Lineage.
++	 */
++	printf("OLIVE RESET: type %u via PS_HOLD, LK %s: reset ctl 0x%x, SOFT_RB_SPARE 0x%x -> 0x%x (spmi %d)%s\n",
++	    type, olive_mode_names[olive_reset_mode], ctl, spare, check, rc,
++	    (!rc && (check >> 2) == olive_reset_mode && (ctl & 0xf) == OLIVE_PON_RESET_TYPE_WARM) ? "" : " NOT SET");
++	olive_pshold_drop(olive_pshold);
++}
++
++/*
++ * PEHaltRestartInternal and IOPlatformExpert::haltRestart before this
++ * platform expert has a hook: PS_HOLD through the 0402 alias, nothing else
++ * (no SPMI mapping yet). Returns -1, as stock does, while there is no alias.
++ */
++int
++olive_early_halt_restart(unsigned int type)
++{
++	if (!olive_restart_type(type) || olive_early_pshold == NULL) {
++		return -1;
++	}
++	printf("OLIVE RESET: early type %u via PS_HOLD (LK mode as the shim left the PON)\n", type);
++	olive_pshold_drop(olive_early_pshold);
++}
++
++static void
++olive_reboot_timer(void *arg, wait_result_t wr __unused)
++{
++	uint32_t secs = (uint32_t)(uintptr_t)arg;
++	/*
++	 * A minute at a time: on onclite one IOSleep of 1800 s hung (E3, E3b)
++	 * while 480 s and 600 s worked (ns * 19.2 MHz overflows above ~960 s).
++	 */
++	for (uint32_t left = secs; left != 0;) {
++		uint32_t step = left > 60 ? 60 : left;
++		IOSleep(step * 1000);
++		left -= step;
++	}
++	IOLog("OLIVE RESET: olive_reboot_after=%u expired, restarting\n", secs);
++	/* flush the file system caches first (RB_QUICK: sync, no process shutdown) */
++	reboot_kernel(OLIVE_RB_QUICK, NULL);
++	PEHaltRestart(kPERestartCPU);
++}
++
++static void
++olive_reset_start(void)
++{
++	char mode[16] = "recovery";
++	PE_parse_boot_argn("olive_reset_to", mode, sizeof(mode));
++	olive_reset_mode = !strcmp(mode, "normal") ? OLIVE_LK_NORMAL :
++	    !strcmp(mode, "fastboot") ? OLIVE_LK_FASTBOOT : OLIVE_LK_RECOVERY;
++	olive_spmi_init();
++	uint8_t spare = 0, ctl = 0;
++	int rc = olive_pon_read(OLIVE_PON_SOFT_RB_SPARE, &spare);
++	if (!rc) {
++		rc = olive_pon_read(OLIVE_PON_PS_HOLD_RESET_CTL, &ctl);
++	}
++	/* what the shim (SH-1b) left: warm type 0x1 and SOFT_RB_SPARE mode 1 expected from M3 on */
++	IOLog("OLIVE RESET: PON SOFT_RB_SPARE 0x%x PS_HOLD_RESET_CTL 0x%x (spmi %d), restarts go to LK %s\n",
++	    spare, ctl, rc, olive_mode_names[olive_reset_mode]);
++	vm_offset_t imem = ml_io_map(OLIVE_IMEM_PA, 0x1000);
++	if (imem != 0) {
++		olive_imem_reason = (volatile uint32_t *)(imem + OLIVE_IMEM_RESTART_REASON);
++	}
++	olive_pshold = (volatile uint32_t *)ml_io_map(OLIVE_PSHOLD_PA, 0x1000);
++	if (olive_pshold == NULL) {
++		olive_pshold = olive_early_pshold;
++	}
++	if (olive_pshold != NULL) {
++		PE_halt_restart = olive_halt_restart;
++	}
++	uint32_t secs = 0;
++	if (PE_parse_boot_argn("olive_reboot_after", &secs, sizeof(secs)) && secs != 0) {
++		thread_t thread;
++		if (kernel_thread_start(olive_reboot_timer, (void *)(uintptr_t)secs, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++	}
++	IOLog("OLIVE RESET: restart via PS_HOLD %s, reboot timer %u s\n",
++	    olive_pshold != NULL ? "ready" : "UNAVAILABLE", secs);
++}
++#endif /* ARM64_BOARD_CONFIG_OLIVE */
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++	olive_reset_start();
++#endif
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ 	taimen_ps_hold = (volatile uint32_t *)ml_io_map(0x10ac000, 0x1000);
+ 	PE_halt_restart = taimen_halt_restart;
