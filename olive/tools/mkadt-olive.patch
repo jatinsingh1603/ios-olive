@@ -1,0 +1,23 @@
+--- a/tools/mkadt.py	2026-10-27 00:20:16
++++ b/tools/mkadt.py	2026-10-27 00:20:16
+@@ -5,6 +5,8 @@
+ address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--pixel1]
+ --pixel1: Google Pixel 1 (sailfish, MSM8996) presented as an iPhone 8 instead.
+ --taimen: Google Pixel 2 XL (taimen, MSM8998), iPhone X identity, 4K-page kernel.
++--olive: Xiaomi Redmi 8 (olive, SDM439), iPhone X identity, 4K-page OLIVE kernel;
++built by olive/tools/mkadt_olive.py (GICv2, ramoops, eMMC, LK splash; env OLIVE_*).
+ """
+ import hashlib, os, struct, sys
+ 
+@@ -371,6 +373,11 @@
+ 
+ 
+ if __name__ == '__main__':
++    if '--olive' in sys.argv:
++        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../olive/tools'))
++        import mkadt_olive  # noqa: E402
++        mkadt_olive.main([a for a in sys.argv if a != '--olive'])
++        sys.exit(0)
+     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, pixel1='--pixel1' in sys.argv, taimen='--taimen' in sys.argv)
+     blob = adt.serialize(root)
+     open(sys.argv[1], 'wb').write(blob)
