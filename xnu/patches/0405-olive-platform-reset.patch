@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_perf.c b/bsd/dev/sweet_perf.c
-index 8933fb4..8f819a4 100644
+index 8933fb4..cabf265 100644
 --- a/bsd/dev/sweet_perf.c
 +++ b/bsd/dev/sweet_perf.c
 @@ -37,6 +37,8 @@
@@ -20,6 +20,15 @@ index 8933fb4..8f819a4 100644
  perf_clocks(void)
  {
  	vm_offset_t apc0 = ml_io_map(CLK_APC0_PA, 0x1000), apc1 = ml_io_map(CLK_APC1_PA, 0x1000);
+@@ -501,7 +503,7 @@ dbg_run(vm_offset_t dbg, uint32_t ticks)
+ 	return clk_rd(dbg, 0x8) & 0x1ffffffu;
+ }
+ 
+-static uint64_t
++static uint64_t __attribute__((unused))  /* not called on olive (0405) */
+ clk_measure_mhz(uint32_t sel)
+ {
+ 	static vm_offset_t dbg, xo4;
 @@ -1626,7 +1628,9 @@ perf_thread(void *arg, wait_result_t result)
  {
  	(void)arg;
@@ -81,7 +90,7 @@ index 7a32a23..7fe4c60 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 8eb9c12..a0fa01b 100644
+index 8eb9c12..c2f34ba 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -14,6 +14,9 @@
@@ -94,7 +103,7 @@ index 8eb9c12..a0fa01b 100644
  
  class SweetPlatformExpert : public IODTPlatformExpert {
  	OSDeclareDefaultStructors(SweetPlatformExpert);
-@@ -390,9 +393,299 @@ taimen_halt_restart(unsigned int type __unused)
+@@ -390,9 +393,300 @@ taimen_halt_restart(unsigned int type __unused)
  }
  #endif
  
@@ -265,7 +274,8 @@ index 8eb9c12..a0fa01b 100644
 +		IOLog("OLIVE RESET: SPMI mapping failed\n");
 +		return;
 +	}
-+	for (uint32_t apid = 0; OLIVE_SPMI_APID_MAP(apid) < 0x1000; apid++) {
++	/* 512 map entries in core, but chnls/obsrvr (0x800000 each) only hold 256 channels */
++	for (uint32_t apid = 0; apid < 0x800000 / OLIVE_SPMI_CHNL_STRIDE; apid++) {
 +		uint32_t map = *(volatile uint32_t *)(core + OLIVE_SPMI_APID_MAP(apid));
 +		if (map == 0 || ((map >> 8) & 0xfff) != OLIVE_PON_PPID) {
 +			continue;
