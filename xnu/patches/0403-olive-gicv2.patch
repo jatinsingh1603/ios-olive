@@ -1,0 +1,350 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index de0e1c2..ec4dc32 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1959,8 +1959,16 @@ sleh_irq(arm_saved_state_t *state)
+ 	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+ 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
+ 	 */
++#if HAS_GIC_V2
++	/* olive: memory-mapped GICv2 CPU interface; EOIR takes the whole IAR (SGI source CPU). */
++	uint32_t iar = sweet_gic_ack();
++	uint32_t intid = iar & GICC_IAR_INTID_MASK;
++#define SWEET_GIC_EOI(i) sweet_gic_eoi(i)
++#else
+ 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
+ 	uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
++#define SWEET_GIC_EOI(i) __builtin_arm_wsr64("ICC_EOIR1_EL1", (i))
++#endif
+ 	static uint32_t sweet_irq_seen;   /* bring-up: first interrupts taken */
+ 	if (sweet_irq_seen < 10) {
+ 		sweet_irq_seen++;
+@@ -1977,11 +1985,11 @@ sleh_irq(arm_saved_state_t *state)
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+ 		INTERRUPT_MASKED_DEBUG_END();
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+ 		/* Ack before handling so an IPI raised meanwhile is not lost */
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 		__builtin_arm_isb(ISB_SY);
+ 		cpu_signal_handler();
+ 	} else {
+@@ -1994,9 +2002,10 @@ sleh_irq(arm_saved_state_t *state)
+ 			    cdp->interrupt_nub,
+ 			    intid);
+ 		}
+-		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
++		SWEET_GIC_EOI(iar);
+ 	}
+ 	__builtin_arm_isb(ISB_SY);
++#undef SWEET_GIC_EOI
+ #else
+ 	sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+ 
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index de07238..9b9751b 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -431,6 +431,273 @@ pe_init_fiq()
+ 	__builtin_arm_isb(ISB_SY);
+ #endif /* SWEET */
+ }
++#elif HAS_GIC_V2
++/*
++ * olive: GICv2 (QGIC2, GICD_IIDR 0x1070) with security extensions, after
++ * onclite's 0101 (SDM632, same IIDRs). TrustZone owns Group 0; the timer,
++ * SGIs and SWEET driver SPIs are Group 1 non-secure and arrive as IRQs
++ * (sleh_irq). The CPU interface is memory-mapped and banked per core; the
++ * shim and PSCI CPU_ON leave it to us on every core.
++ */
++SECURITY_READ_ONLY_LATE(uint32_t) sweet_vtimer_intid = SWEET_VTIMER_INTID;
++
++/* GICv2 spec (Arm IHI 0048B) offsets; GICD_CTLR/TYPER/SGIR and GICC_* are in SWEET.h/OLIVE.h. */
++#define GICD_IIDR               0x008
++#define GICD_ISENABLER(n)       (0x0100 + 4 * (n))
++#define GICD_ICENABLER(n)       (0x0180 + 4 * (n))
++#define GICD_ICPENDR(n)         (0x0280 + 4 * (n))
++#define GICD_IPRIORITYR(n)      (0x0400 + (n))
++#define GICD_ITARGETSR(n)       (0x0800 + (n))
++#define GICD_ICFGR(n)           (0x0C00 + 4 * (n))
++#define GICD_TYPER_ITLINES      0x1f
++#define GICC_CTLR_ENABLEGRP1    0x1     /* non-secure view: bit 0 enables Group 1 */
++#define SWEET_SPI_MAX           1020
++
++static vm_offset_t gicd_base;
++static vm_offset_t gicc_base;
++/* INTIDs the distributor implements: 32 * (ITLinesNumber + 1), olive 352 (TYPER 0x4ea). */
++static uint32_t gic_nirqs;
++
++/*
++ * GICv2 CPU interface bit of each logical CPU (GICD_ITARGETSR, SGIR target
++ * list). Indexed by ml_get_cpu_number_local(), checked against MAX_CPUS:
++ * an MPIDR the ADT does not list must not write past the end.
++ */
++static uint8_t gic_cpu_iface_mask[MAX_CPUS];
++
++static uint32_t
++_gic_read32(vm_offset_t addr)
++{
++	return *((volatile uint32_t *) addr);
++}
++
++static uint8_t
++_gic_read8(vm_offset_t addr)
++{
++	return *((volatile uint8_t *) addr);
++}
++
++static void
++_gic_write32(vm_offset_t addr, uint32_t value)
++{
++	*((volatile uint32_t *) addr) = value;
++}
++
++static void
++_gic_write8(vm_offset_t addr, uint8_t value)
++{
++	*((volatile uint8_t *) addr) = value;
++}
++
++#define gicd_read32(offset) (_gic_read32(gicd_base + (offset)))
++#define gicd_write32(offset, data) (_gic_write32(gicd_base + (offset), (data)))
++#define gicc_read32(offset) (_gic_read32(gicc_base + (offset)))
++#define gicc_write32(offset, data) (_gic_write32(gicc_base + (offset), (data)))
++
++/* Banked GICD_ITARGETSR0..7 read as the calling core's own CPU interface bit. */
++static uint8_t
++gic_self_mask(void)
++{
++	return _gic_read8(gicd_base + GICD_ITARGETSR(0));
++}
++
++void
++pe_init_fiq()
++{
++	int error;
++	DTEntry entry;
++	bool first = false;
++
++	// gicd_base is 0x0 only before it's initialized by the boot processor.
++	// Avoid calling SecureDT* routines on secondary processors to avoid
++	// race conditions because they are not thread-safe.
++	if (!gicd_base) {
++		error = SecureDTLookupEntry(NULL, "/arm-io/gic", &entry);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC node in DT", __func__);
++		}
++
++		// reg = <GICD base, GICD size, GICC base, GICC size>, arm-io relative
++		void const *prop;
++		unsigned int prop_size;
++		error = SecureDTGetProperty(entry, "reg", &prop, &prop_size);
++		if (error != kSuccess) {
++			panic("%s: cannot find GIC MMIO regions in DT", __func__);
++		}
++		if (prop_size < 4 * sizeof(uint64_t)) {
++			panic("%s: incorrect reg property size in GIC DT node; expecting 32 bytes but got %u bytes", __func__, prop_size);
++		}
++
++		void const *timer_prop;
++		unsigned int timer_size;
++		if (SecureDTGetProperty(entry, "virtual-timer-intid", &timer_prop, &timer_size) == kSuccess) {
++			if (timer_size != sizeof(uint32_t)) {
++				panic("%s: invalid virtual-timer-intid size %u", __func__, timer_size);
++			}
++			uint32_t intid = *(const uint32_t *)timer_prop;
++			if (intid < 16 || intid >= 32) {
++				panic("%s: virtual timer INTID %u is not a PPI", __func__, intid);
++			}
++			sweet_vtimer_intid = intid;
++		}
++
++		/* mkadt_olive: 0x0a000000/0x0a002000 + soc base 0x01000000 = GICD 0x0b000000, GICC 0x0b002000 */
++		vm_offset_t soc_base_phys = pe_arm_get_soc_base_phys();
++		uint64_t const *reg = (uint64_t const *) prop;
++
++		gicd_base = ml_io_map(soc_base_phys + reg[0], reg[1]);
++		if (!gicd_base) {
++			panic("%s: cannot map GICD region", __func__);
++		}
++		gicc_base = ml_io_map(soc_base_phys + reg[2], reg[3]);
++		if (!gicc_base) {
++			panic("%s: cannot map GICC region", __func__);
++		}
++		gic_nirqs = 32 * ((gicd_read32(GICD_TYPER) & GICD_TYPER_ITLINES) + 1);
++		if (gic_nirqs > SWEET_SPI_MAX) {
++			gic_nirqs = SWEET_SPI_MAX;
++		}
++		first = true;
++	}
++
++	unsigned int me = ml_get_cpu_number_local();
++	if (me >= MAX_CPUS) {
++		panic("OLIVE GIC: MPIDR 0x%llx not in ADT", __builtin_arm_rsr64("MPIDR_EL1"));
++	}
++
++	/* This core's CPU interface: the SGI target list for it and the SPI route for its drivers. */
++	uint8_t self = gic_self_mask();
++	if (self == 0 || (self & (self - 1)) != 0) {
++		panic("%s: core %u has no single GIC CPU interface (ITARGETSR0=0x%x)", __func__, me, self);
++	}
++	os_atomic_store(&gic_cpu_iface_mask[me], self, release);
++
++	/* SGIs and PPIs (INTID 0-31) are banked: priority and enable per core. */
++	for (unsigned int i = 0; i < 32; i++) {
++		_gic_write8(gicd_base + GICD_IPRIORITYR(i), 0xa0);
++	}
++	gicd_write32(GICD_ICENABLER(0), ~((1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI)));
++	gicd_write32(GICD_ISENABLER(0), (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++
++	/*
++	 * LK leaves SPIs enabled (some still pending) and the shim may not
++	 * have caught all of them: quiet every shared line once, from the boot
++	 * core, until a SWEET driver attaches it. Group 0 SPIs are WI here.
++	 */
++	if (first) {
++		for (uint32_t n = 1; n < gic_nirqs / 32; n++) {
++			gicd_write32(GICD_ICENABLER(n), 0xffffffff);
++			gicd_write32(GICD_ICPENDR(n), 0xffffffff);
++		}
++	}
++
++	gicc_write32(GICC_PMR, 0xff);
++	gicc_write32(GICC_BPR, 0);
++	gicc_write32(GICC_CTLR, gicc_read32(GICC_CTLR) | GICC_CTLR_ENABLEGRP1);
++	gicd_write32(GICD_CTLR, gicd_read32(GICD_CTLR) | GICD_CTLR_ENABLEGRP1);
++	__builtin_arm_dsb(DSB_SY);
++	__builtin_arm_isb(ISB_SY);
++
++	kprintf("OLIVE GIC: GICv2 typer=%x iidr=%x iface=%x vtimer=%u\n",
++	    gicd_read32(GICD_TYPER), gicd_read32(GICD_IIDR), self, sweet_vtimer_intid);
++}
++
++/* sleh_irq: acknowledge (GICC_IAR) and complete (GICC_EOIR) one interrupt. */
++uint32_t
++sweet_gic_ack(void)
++{
++	return gicc_read32(GICC_IAR);
++}
++
++/* The full IAR: for an SGI, bits 12:10 name the source CPU and must match. */
++void
++sweet_gic_eoi(uint32_t iar)
++{
++	gicc_write32(GICC_EOIR, iar);
++}
++
++/* SGI to one logical CPU, through its GICv2 CPU interface bit. */
++void
++sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi)
++{
++	if (cpu >= MAX_CPUS || gic_cpu_iface_mask[cpu] == 0) {
++		panic("%s: cpu %u has no known GIC CPU interface", __func__, cpu);
++	}
++	__builtin_arm_dsb(DSB_ISHST);
++	gicd_write32(GICD_SGIR, ((uint32_t)gic_cpu_iface_mask[cpu] << GICD_SGIR_TARGET_SHIFT) | (sgi & 0xf));
++}
++
++/* SweetCPU::startAll: the target has run pe_init_fiq (its interface is known). */
++boolean_t
++sweet_gic_cpu_ready(unsigned int cpu)
++{
++	return cpu < MAX_CPUS && os_atomic_load(&gic_cpu_iface_mask[cpu], acquire) != 0;
++}
++
++/*
++ * Device interrupts (GIC SPIs) for SWEET drivers: the GICv2 form of the
++ * GICv3 API above (sweet_touch.c, sailfish_wlan.c link against it). The
++ * SPI is routed to the CPU interface of the core that attaches it; its
++ * handler runs in interrupt context and must quiet the device before
++ * returning (the interrupt is ended after it).
++ */
++static struct {
++	void (*fn)(void *arg);
++	void *arg;
++} sweet_spi[SWEET_SPI_MAX];
++
++bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++void sweet_spi_mask(uint32_t intid, bool masked);
++bool sweet_spi_dispatch(uint32_t intid);
++
++bool
++sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg)
++{
++	if (intid < 32 || intid >= gic_nirqs || fn == NULL || gicd_base == 0) {
++		return false;
++	}
++	uint32_t bit = 1u << (intid % 32);
++	gicd_write32(GICD_ICENABLER(intid / 32), bit);
++	__builtin_arm_dsb(DSB_SY);
++	sweet_spi[intid].arg = arg;
++	sweet_spi[intid].fn = fn;
++	__builtin_arm_dmb(DMB_ISH);
++	uint32_t cfg = gicd_read32(GICD_ICFGR(intid / 16)), edge_bit = 2u << (2 * (intid % 16));
++	gicd_write32(GICD_ICFGR(intid / 16), edge ? (cfg | edge_bit) : (cfg & ~edge_bit));
++	_gic_write8(gicd_base + GICD_IPRIORITYR(intid), 0xa0);
++	uint8_t self = gic_self_mask();
++	_gic_write8(gicd_base + GICD_ITARGETSR(intid), self);
++	gicd_write32(GICD_ISENABLER(intid / 32), bit);
++	__builtin_arm_dsb(DSB_SY);
++	/* A Group 0 (secure) SPI is RAZ/WI from here: the enable never latches. */
++	if (!(gicd_read32(GICD_ISENABLER(intid / 32)) & bit)) {
++		kprintf("OLIVE GIC: SPI intid %u did not enable (secure Group 0?)\n", intid);
++		sweet_spi[intid].fn = NULL;
++		return false;
++	}
++	kprintf("OLIVE GIC: SPI intid %u (%s) attached, CPU interface 0x%x\n", intid, edge ? "edge" : "level", self);
++	return true;
++}
++
++/* Masked: the line stays quiet at the GIC (a driver giving up on a storming interrupt). */
++void
++sweet_spi_mask(uint32_t intid, bool masked)
++{
++	if (intid >= 32 && intid < gic_nirqs && gicd_base) {
++		gicd_write32(masked ? GICD_ICENABLER(intid / 32) : GICD_ISENABLER(intid / 32), 1u << (intid % 32));
++	}
++}
++
++/* From sleh_irq: false if nobody attached the INTID. */
++bool
++sweet_spi_dispatch(uint32_t intid)
++{
++	if (intid >= SWEET_SPI_MAX || sweet_spi[intid].fn == NULL) {
++		return false;
++	}
++	sweet_spi[intid].fn(sweet_spi[intid].arg);
++	return true;
++}
+ #else
+ void
+ pe_init_fiq()
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index 9004f2b..f74a578 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -39,6 +39,20 @@ void pe_init_fiq(void);
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern uint32_t sweet_vtimer_intid;
+ #endif
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++/*
++ * GICv2 CPU interface and SPI helpers (pexpert/arm/pe_fiq.c, HAS_GIC_V2).
++ * Gated on the command-line board macro, not HAS_GIC_V2: sleh.c includes
++ * this header before board_config.h.
++ */
++uint32_t sweet_gic_ack(void);
++void sweet_gic_eoi(uint32_t iar);
++void sweet_gic_send_sgi(unsigned int cpu, unsigned int sgi);
++boolean_t sweet_gic_cpu_ready(unsigned int cpu);
++bool sweet_spi_attach(uint32_t intid, bool edge, void (*fn)(void *arg), void *arg);
++void sweet_spi_mask(uint32_t intid, bool masked);
++bool sweet_spi_dispatch(uint32_t intid);
++#endif
+ 
+ #ifdef PRIVATE
+ /**
