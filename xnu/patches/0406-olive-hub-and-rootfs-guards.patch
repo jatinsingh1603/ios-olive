@@ -1,0 +1,123 @@
+diff --git a/bsd/dev/mem.c b/bsd/dev/mem.c
+index dbe055e..481aca1 100644
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -204,12 +204,13 @@ sweet_null_tee(char *name, size_t len)
+ 	return false;
+ }
+ 
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ /*
+  * TAIMEN: backboardd writes the same line once per frame (boot 17: 60 a second),
+  * which pushed the whole boot out of the 1 MiB log ring. An identical write from
+  * the same process is counted instead of printed; the count goes out every 600
+- * repeats and when the text changes.
++ * repeats and when the text changes. OLIVE too: its ramoops console zone is
++ * only 512 KiB.
+  */
+ #include <kern/locks.h>
+ #define SWEET_NULL_REPORT 600
+@@ -359,7 +360,7 @@ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
+ 					if (error) {
+ 						break;
+ 					}
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ 					sweet_null_emit(name, buf, c);
+ #else
+ 					printf("|%s| %.*s%s", name, (int)c, buf,
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index f1bf592..6cab9e8 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -48,6 +48,25 @@ extern int get_preemption_level(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
++
++/*
++ * OLIVE (Redmi 8, SDM439) has eMMC, not UFS, and none of the Pixel 1 / taimen
++ * hardware below: its root device is bsd/dev/olive_emmc.c (0407). sweet_ufs_init
++ * is also the driver hub (keys, touch, USB, perf, GPU, Wi-Fi), and every one of
++ * those drivers pokes MSM8996/MSM8998 addresses that on olive are either live
++ * peripherals (TLMM 0x01010000 + pin * 0x1000 is inside olive's TLMM at
++ * 0x01000000: real GPIOs) or unclaimed (the MSM8996 SPMI arbiter at 0x0400f000;
++ * olive's is at 0x0200f000, live.dts:1983). So on OLIVE the init refuses
++ * before even looking at the ADT: a /sweet-ufs node copied from the taimen ADT
++ * template must not reach the hub. A macro, not an #if around the body, so the
++ * rest still compiles on OLIVE without -Wunreachable-code / -Wunused-function.
++ */
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++#define SWEET_UFS_HUB_BLOCKED   1
++#else
++#define SWEET_UFS_HUB_BLOCKED   0
++#endif
++
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+@@ -681,6 +700,11 @@ sweet_ufs_init(void)
+ 	char want[64] = "userdata";
+ 	int error;
+ 
++	if (SWEET_UFS_HUB_BLOCKED) {
++		/* OLIVE: no UFS host, and the Pixel 1 / taimen drivers must never start */
++		printf("SWEET UFS: olive: no UFS, Pixel 1/taimen driver hub blocked\n");
++		return ENXIO;
++	}
+ 	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+@@ -773,6 +797,12 @@ sweet_ufs_init(void)
+ 	taimen_sensors_init();
+ 	/* USB: the state probe; with sweetusb=2 USB Ethernet to the PC (0297, sweet_usb.c) */
+ 	sweet_usb_probe();
++#elif defined(ARM64_BOARD_CONFIG_OLIVE)
++	/*
++	 * Unreachable (SWEET_UFS_HUB_BLOCKED above), and empty on purpose: none of
++	 * the Pixel 1 / taimen drivers is retargeted to SDM439. The olive board hook
++	 * is olive_board_start() from the eMMC root path (0407).
++	 */
+ #else
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 61b1bd8..edf9f0f 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1101,7 +1101,7 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ 	{
+ 		extern void taimen_rootfix(void);
+ 		taimen_rootfix();       /* patch the mounted iOS root from the ROOTFIX blob */
+diff --git a/bsd/kern/taimen_rootfix.c b/bsd/kern/taimen_rootfix.c
+index 33a8799..73b1b6c 100644
+--- a/bsd/kern/taimen_rootfix.c
++++ b/bsd/kern/taimen_rootfix.c
+@@ -15,7 +15,7 @@
+  *            is replaced by IOPlatformUUID
+  * Without the blob nothing happens. Boot-arg taimenrootfix=0 skips it.
+  */
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 9ebf08e..9cfa838 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -14580,7 +14580,7 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
+ 	return error;
+ }
+ 
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ /* bsd/kern/taimen_rootfix.c: mkdir with a kernel-space path (mkdir1at is static). */
+ int taimen_mkdir(const char *path, int mode, vfs_context_t ctx);
+ int
