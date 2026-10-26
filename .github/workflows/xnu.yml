@@ -10,8 +10,8 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG (TAIMEN = Pixel 2 XL, SWEET = the Pixel 1 / Redmi kernel)
-        default: TAIMEN
+        description: xnu MACHINE_CONFIG (TAIMEN = Pixel 2 XL, SWEET = the Pixel 1 / Redmi kernel, OLIVE = Redmi 8); empty = OLIVE on the olive branch, TAIMEN elsewhere
+        default: ""
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -19,7 +19,7 @@ on:
         description: also upload the build tree for local compiles (slow, rarely needed)
         default: "false"
   push:
-    branches: [main, taimen]
+    branches: [main, taimen, olive]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
@@ -36,7 +36,12 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'TAIMEN' }}
+  # Push runs have no inputs: the olive branch builds OLIVE, every other branch TAIMEN.
+  MACHINE_CONFIG: ${{ inputs.machine_config || (github.ref_name == 'olive' && 'OLIVE' || 'TAIMEN') }}
+  # -mcpu for libfirehose_kernel (see "Fetch build script"). Kryo for the Pixels; the Redmi 8
+  # (SDM439) is Cortex-A53 only. Workflow-level env cannot read env, so MACHINE_CONFIG is
+  # recomputed here; keep the two expressions in step.
+  FIREHOSE_MCPU: ${{ (inputs.machine_config || (github.ref_name == 'olive' && 'OLIVE' || 'TAIMEN')) == 'OLIVE' && 'cortex-a53' || 'kryo' }}
   # Bump to throw away every cache below (sources, built deps, ccache).
   CACHE_SALT: v1
   CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -58,11 +63,16 @@ jobs:
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
           # libfirehose_kernel is built arm64e-only with Xcode's default CPU (LSE atomics).
-          # Our kernels are plain arm64 on ARMv8.0 cores (Pixel 1 Kryo, Pixel 2 XL Kryo 280):
-          # build it arm64-only with -mcpu=kryo, as tools/xnu-build-local.sh does. (TAIMEN boot 2
-          # panicked on an LDADD in __firehose_buffer_tracepoint_flush.)
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS='"'"'$(inherited) -mcpu=kryo'"'"'/' dxb/build.sh
-          grep -c "OTHER_CFLAGS='\$(inherited) -mcpu=kryo'" dxb/build.sh
+          # Our kernels are plain arm64 on ARMv8.0 cores (Pixel 1 Kryo, Pixel 2 XL Kryo 280,
+          # Redmi 8 Cortex-A53): build it arm64-only with -mcpu=$FIREHOSE_MCPU, as
+          # tools/xnu-build-local.sh does. (TAIMEN boot 2 panicked on an LDADD in
+          # __firehose_buffer_tracepoint_flush.) On the A53 the library is linked into the kernel,
+          # so it also gets the 835769 erratum fix the OLIVE kernel itself is built with.
+          FH_CFLAGS="-mcpu=$FIREHOSE_MCPU"
+          [ "$FIREHOSE_MCPU" = cortex-a53 ] && FH_CFLAGS="$FH_CFLAGS -mfix-cortex-a53-835769"
+          echo "libfirehose_kernel: MACHINE_CONFIG=$MACHINE_CONFIG OTHER_CFLAGS += $FH_CFLAGS"
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" OTHER_CFLAGS='"'"'$(inherited) '"$FH_CFLAGS"''"'"'/' dxb/build.sh
+          grep -cF "OTHER_CFLAGS='\$(inherited) $FH_CFLAGS'" dxb/build.sh
           # Shallow clones: the Apple source tags are all we ever check out
           sed -i '' 's/git clone --branch/git clone --depth 1 --branch/' dxb/build.sh
           grep -c 'git clone --depth 1 --branch' dxb/build.sh
@@ -105,7 +115,10 @@ jobs:
 
       # 2. Built dependencies: mig, ctf tools, availability.pl, installed xnu and
       #    Libsystem headers, libplatform headers, libfirehose_kernel.a. None of
-      #    them depend on our kernel patches, so the key is the toolchain only.
+      #    them depend on our kernel patches, but build.sh installs the xnu headers
+      #    with TARGET_CONFIGS naming MACHINE_CONFIG and only rebuilds libfirehose
+      #    when the .a is missing, so the key carries the firehose CPU and the
+      #    machine config as well as the toolchain.
       #    The Kernels dir is excluded so a failed build can never hand the Collect
       #    step a stale kernel.
       - name: Cache built dependencies (fakeroot)
@@ -114,7 +127,7 @@ jobs:
           path: |
             dxb/fakeroot
             !dxb/fakeroot/System/Library/Kernels
-          key: fakeroot-${{ env.CACHE_SALT }}-kryo1-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-${{ env.XCODE_VER }}
+          key: fakeroot-${{ env.CACHE_SALT }}-fh-${{ env.FIREHOSE_MCPU }}-${{ env.MACHINE_CONFIG }}-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-${{ env.XCODE_VER }}
 
       # 3. ccache for the kernel compile itself. A new entry is saved every run
       #    (unique key); the newest matching prefix is restored.
