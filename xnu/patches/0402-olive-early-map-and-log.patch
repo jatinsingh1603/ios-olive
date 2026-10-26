@@ -1,0 +1,318 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 5dd274c..41c3048 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1832,16 +1832,24 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+  * for a Device alias of the early log block (sweet_early.c) that survives
+  * bootstrap TTBR0 teardown.
+  */
+-#if defined(TAIMEN)
++#if defined(TAIMEN) || defined(OLIVE)
+ /*
+  * 4K pages, compact layout: VM_MIN_KERNEL_ADDRESS sits in another 1 GB L1
+  * entry than the kernel, which has no L2 table yet. Use the free 2 MB slots
+  * between the low globals and the kernel text inside the kernel's own L1
+  * entry instead: slots 1-18 alias the splash framebuffer, 19 the early log
+  * block, 20 the MDP block (sweet_early.c relocates to this layout).
++ * OLIVE: slots 1-10 alias the LK splash region (0x90000000, framebuffer at
++ * +0x1000), 11 the early log block, 12 the 2 MB IO block holding PS_HOLD
++ * (0x004ab000) for an early reset; no MDP kick on the video-mode panel.
+  */
+ #define SWEET_EARLY_FB_VA ((VM_KERNEL_LINK_ADDRESS & ~((1ULL << 30) - 1)) + ARM_TT_L2_SIZE)
++#if defined(OLIVE)
++#define SWEET_EARLY_ALIAS_BLOCKS (OLIVE_SPLASH_BLOCKS + 2u)
++_Static_assert(SWEET_EARLY_ALIAS_BLOCKS == 12u, "sweet_early_relocate assumes 10 splash blocks, log, PS_HOLD");
++#else
+ #define SWEET_EARLY_ALIAS_BLOCKS 20u
++#endif
+ 
+ static void
+ sweet_early_map_block(vm_map_address_t va, uint64_t pa)
+@@ -1862,14 +1870,23 @@ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+ 	assert(va + SWEET_EARLY_ALIAS_BLOCKS * ARM_TT_L2_SIZE <= gVirtBase);
++#if defined(OLIVE)
++	for (unsigned int i = 0; i < OLIVE_SPLASH_BLOCKS; i++) {
++		sweet_early_map_block(va + i * ARM_TT_L2_SIZE, OLIVE_SPLASH_PA + (uint64_t)i * ARM_TT_L2_SIZE);
++	}
++	sweet_early_map_block(va + OLIVE_SPLASH_BLOCKS * ARM_TT_L2_SIZE, SWEET_EARLY_LOG_BLOCK);
++	sweet_early_map_block(va + (OLIVE_SPLASH_BLOCKS + 1u) * ARM_TT_L2_SIZE,
++	    OLIVE_PSHOLD_PA & ~(uint64_t)(ARM_TT_L2_SIZE - 1));
++#else
+ 	for (unsigned int i = 0; i < 18u; i++) {
+ 		sweet_early_map_block(va + i * ARM_TT_L2_SIZE, 0x9d400000ULL + (uint64_t)i * ARM_TT_L2_SIZE);
+ 	}
+ 	sweet_early_map_block(va + 18u * ARM_TT_L2_SIZE, SWEET_EARLY_LOG_BLOCK);
+ 	sweet_early_map_block(va + 19u * ARM_TT_L2_SIZE, 0xc800000ULL);
++#endif
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+-#else /* !TAIMEN */
++#else /* !TAIMEN && !OLIVE */
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+ 
+ static void
+@@ -1888,7 +1905,7 @@ sweet_early_map_final(void)
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+-#endif /* TAIMEN */
++#endif /* TAIMEN || OLIVE */
+ #endif
+ 
+ void
+@@ -2003,6 +2020,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ #if defined(TAIMEN)
+ 	pages_used += 1;        /* start.s: the MDP Device block (L1 index 0) */
+ #endif
++	/* OLIVE: none; start.s puts its Device blocks into RAM's L1-index-2 L2 table. */
+ 	/* stock xnu compared pages with BOOTSTRAP_TABLE_SIZE in bytes: it never fired */
+ 	if (pages_used > BOOTSTRAP_TABLE_SIZE / ARM_PGBYTES) {
+ 		panic("BOOTSTRAP_TABLE_SIZE too small for memory config");
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index adedfba..fac2b4c 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -327,11 +327,13 @@ LEXT(sweet_secondary_entry)
+ 	mov		x1, #3
+ 	msr		CNTHCTL_EL2, x1
+ 	msr		CNTVOFF_EL2, xzr
++#if HAS_GIC_V3
+ 	/* Permit ICC_SRE_EL1 and GIC CPU interface system-register access. */
+ 	mrs		x1, ICC_SRE_EL2
+ 	orr		x1, x1, #1
+ 	orr		x1, x1, #8
+ 	msr		ICC_SRE_EL2, x1
++#endif /* HAS_GIC_V3: a GICv2 (olive) has no ICC_* registers at all */
+ 	/* Known Armv8 SCTLR RES1 bits, M/C/I off, little endian. */
+ 	MOV64	x1, 0x30d00800
+ 	msr		SCTLR_EL1, x1
+@@ -540,7 +542,29 @@ LEXT(start_first_cpu)
+ 	 * shim started (layout in sweet_early.c), no stack or page tables.
+ 	 */
+ 	MOV64	x0, SWEET_EARLY_LOG_PRZ
++#if defined(OLIVE)
++	/*
++	 * Nothing bounds the append below. If the shim left no valid record
++	 * ("DBGC", size with room for this line), start an empty one the way
++	 * sweet_log_raw does: start and size first, then the signature.
++	 */
++	ldr		w5, [x0]			// sig
++	MOV32	w6, 0x43474244			// "DBGC"
+ 	ldr		w1, [x0, #8]			// size
++	MOV32	w7, (SWEET_EARLY_LOG_PRZ_SIZE - 12 - 64)
++	cmp		w5, w6
++	b.ne	Lolive_s0_reset
++	cmp		w1, w7
++	b.lo	Lolive_s0_ok
++Lolive_s0_reset:
++	str		wzr, [x0, #4]			// start
++	str		wzr, [x0, #8]			// size
++	str		w6, [x0]			// sig
++	mov		w1, #0
++Lolive_s0_ok:
++#else
++	ldr		w1, [x0, #8]			// size
++#endif
+ 	add		x4, x0, #12			// text
+ 	adr		x2, Lsweet_s0_msg
+ Lsweet_s0_char:
+@@ -575,6 +599,21 @@ Ltaimen_s0_band:
+ 	b.ne	Ltaimen_s0_band
+ 	dsb	sy
+ 	/* No START here: a bare START during a frame transfer desyncs the panel; sweet_early_band kicks properly. */
++#elif defined(OLIVE)
++	/*
++	 * Stage 0 on screen (MMU off): a white band at rows 1400-1463 of the LK
++	 * splash framebuffer (0x90001000, 720x1520, RGB888, 2160 B/row). LK leaves
++	 * the video-mode panel scanning out (probe v2), so no kick is needed.
++	 * 2160 is a multiple of 8, so every store is aligned.
++	 */
++	MOV64	x0, (OLIVE_FB_PA + 1400 * OLIVE_FB_STRIDE)
++	mov	x1, #-1
++	mov	x2, #(64 * OLIVE_FB_STRIDE / 8)
++Lolive_s0_band:
++	str	x1, [x0], #8
++	subs	x2, x2, #1
++	b.ne	Lolive_s0_band
++	dsb	sy
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -773,6 +812,72 @@ Ltaimen_dev_attr1:
+ 	bic	x11, x11, #(ARM_TTE_BLOCK_ATTRINDXMASK)
+ 	orr	x11, x11, #(ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE))
+ 	str	x11, [x12]
++#elif defined(OLIVE)
++	/*
++	 * 4K granule: L1 entries of 1 GB, 2 MB L2 blocks. V=P Device mappings for
++	 * sweet_early.c, all in L1 index 2 (0x80000000-0xbfffffff):
++	 *  - 0x90000000..0x913fffff (OLIVE_SPLASH_BLOCKS = 10 blocks, L2 index
++	 *    128-137): the LK continuous-splash region with the framebuffer;
++	 *  - 0x9fe00000..0x9fffffff (1 block, L2 index 255): the early log
++	 *    block around the ramoops zone at 0x9ff00000.
++	 * xnu RAM starts at 0xa0000000 (L2 index 256 on), so the V=P RAM mapping
++	 * above already made the L2 table for index 2. Another call to
++	 * create_bootstrap_mapping would replace it and unmap the kernel: the
++	 * blocks go into RAM's table. 0x91400000-0x9fdfffff is Linux RAM and is
++	 * not mapped. Device, never executable: no speculative accesses.
++	 */
++#if ((OLIVE_SPLASH_PA >> 30) != 2) || (((OLIVE_SPLASH_PA + OLIVE_SPLASH_BLOCKS * 0x200000 - 1) >> 30) != 2) || \
++	((SWEET_EARLY_LOG_BLOCK >> 30) != 2) || (OLIVE_SPLASH_PA & 0x1fffff) || (SWEET_EARLY_LOG_BLOCK & 0x1fffff)
++#error "OLIVE early Device blocks must be 2 MB aligned and inside L1 index 2"
++#endif
++	MOV64	x0, OLIVE_SPLASH_PA
++	and	x10, x0, #(ARM_TT_L1_INDEX_MASK)
++	lsr	x10, x10, #(ARM_TT_L1_SHIFT)
++	ldr	x12, [x1, x10, lsl #TTE_SHIFT]		// V=P L1 entry for index 2
++	tbnz	x12, #0, Lolive_dev_ram_l2
++	/* Not valid (no RAM in index 2; not an olive layout): give both runs a new L2 page. */
++	add	x2, x2, PGBYTES
++	create_l1_table_entry x0, x1, x2, x10, x11, x12
++	mov	x12, x2
++	b	Lolive_dev_l2
++Lolive_dev_ram_l2:
++	and	x12, x12, #(ARM_TTE_TABLE_MASK)		// RAM's L2 table
++Lolive_dev_l2:
++	/* x12 = the index-2 L2 table: splash run, then the log block */
++	MOV64	x0, OLIVE_SPLASH_PA
++	mov	x4, x0
++	mov	x5, #(OLIVE_SPLASH_BLOCKS)
++	create_l2_block_entries x0, x4, x12, x5, x6, x10, x11, x13
++	MOV64	x10, OLIVE_SPLASH_PA
++	and	x11, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr	x11, x11, #(ARM_TT_L2_SHIFT)
++	add	x6, x12, x11, lsl #TTE_SHIFT
++	mov	x13, #(OLIVE_SPLASH_BLOCKS)
++Lolive_dev_attr_fb:
++	ldr	x11, [x6]
++	bic	x11, x11, #(ARM_TTE_BLOCK_ATTRINDXMASK)
++	orr	x11, x11, #(ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE))
++	orr	x11, x11, #(ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	str	x11, [x6], #(1 << TTE_SHIFT)
++	subs	x13, x13, #1
++	b.ne	Lolive_dev_attr_fb
++	MOV64	x0, SWEET_EARLY_LOG_BLOCK
++	mov	x4, x0
++	mov	x5, #1
++	create_l2_block_entries x0, x4, x12, x5, x6, x10, x11, x13
++	MOV64	x10, SWEET_EARLY_LOG_BLOCK
++	and	x11, x10, #(ARM_TT_L2_INDEX_MASK)
++	lsr	x11, x11, #(ARM_TT_L2_SHIFT)
++	add	x6, x12, x11, lsl #TTE_SHIFT
++	mov	x13, #1
++Lolive_dev_attr_log:
++	ldr	x11, [x6]
++	bic	x11, x11, #(ARM_TTE_BLOCK_ATTRINDXMASK)
++	orr	x11, x11, #(ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE))
++	orr	x11, x11, #(ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	str	x11, [x6], #(1 << TTE_SHIFT)
++	subs	x13, x13, #1
++	b.ne	Lolive_dev_attr_log
+ #elif defined(SWEET)
+ 	/*
+ 	 * Early log block (pstore zone, sweet_early.c): one 32MB Device block
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 11228fb..3d6b8cd 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -23,7 +23,11 @@
+ /* persistent_ram_buffer: "DBGC", start, size, then the text (no ECC) */
+ #define PRZ_OFF         (SWEET_EARLY_LOG_PRZ - SWEET_EARLY_LOG_BLOCK)
+ #define PRZ_SIG         0x43474244u
+-#if defined(TAIMEN)
++#if defined(OLIVE)
++/* olive ramoops console zone is 0x80000 (live.dts); more would overrun pmsg, and Linux drops the record */
++#define PRZ_DATA_MAX    (SWEET_EARLY_LOG_PRZ_SIZE - 12u)
++_Static_assert(PRZ_OFF + 12u + PRZ_DATA_MAX <= 0x200000u, "PRZ must fit in the 2 MB early log block");
++#elif defined(TAIMEN)
+ #define PRZ_DATA_MAX    (0x100000u - 12u)       /* taimen ramoops console zone is 1 MiB */
+ #else
+ #define PRZ_DATA_MAX    (0x80000u - 12u)
+@@ -96,6 +100,48 @@ sweet_early_band(unsigned int stage)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	taimen_kick();
+ }
++#elif defined(OLIVE)
++/*
++ * Stage marks also go on the screen: LK leaves the video-mode panel scanning
++ * out of its splash framebuffer (probe v2), so a band shows up without any
++ * kick. RGB888, bytes 0/1/2 = R/G/B, 720 px = exactly the 2160-byte row.
++ * The framebuffer is Device memory: only aligned 32-bit stores, three words
++ * (four pixels) per pattern repeat. Before arm_vm_init it is V=P through the
++ * bootstrap tables (start.s); after sweet_early_relocate it is an alias next
++ * to the log zone (arm_vm_init.c), as is PS_HOLD.
++ */
++_Static_assert(OLIVE_FB_W * 3u == OLIVE_FB_STRIDE && OLIVE_FB_STRIDE % 12u == 0u, "olive band writer assumes packed 3 B/px rows");
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)OLIVE_FB_PA;
++/* PS_HOLD for an early reset (0405): no V=P mapping, so NULL until relocated. */
++volatile uint32_t *olive_early_pshold;
++
++static void
++sweet_early_band(unsigned int stage)
++{
++	unsigned int y0 = 1000u + 8u * (stage % 60u);
++	/* red, green, blue by stage % 3, paler on odd stages: never black on the black splash */
++	uint32_t rgb = (0xff0000u >> ((stage % 3u) * 8u)) | ((stage & 1u) ? 0x404040u : 0u);
++	uint8_t px[12];
++	for (unsigned int i = 0; i < 12u; i += 3u) {
++		px[i] = (uint8_t)(rgb >> 16);
++		px[i + 1u] = (uint8_t)(rgb >> 8);
++		px[i + 2u] = (uint8_t)rgb;
++	}
++	uint32_t w[3];
++	for (unsigned int i = 0; i < 3u; i++) {
++		w[i] = (uint32_t)px[4u * i] | ((uint32_t)px[4u * i + 1u] << 8) |
++		    ((uint32_t)px[4u * i + 2u] << 16) | ((uint32_t)px[4u * i + 3u] << 24);
++	}
++	for (unsigned int y = y0; y < y0 + 6u && y < OLIVE_FB_H; y++) {
++		volatile uint32_t *row = early_fb + (y * OLIVE_FB_STRIDE) / 4u;
++		for (unsigned int x = 0; x < OLIVE_FB_STRIDE / 4u; x += 3u) {
++			row[x] = w[0];
++			row[x + 1u] = w[1];
++			row[x + 2u] = w[2];
++		}
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
+ #endif
+ #define PRZ_W(off) (*(volatile uint32_t *)(early_base + PRZ_OFF + (off)))
+ 
+@@ -194,7 +240,7 @@ sweet_early_hex(const char *label, uint64_t v)
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-#if defined(TAIMEN)
++#if defined(TAIMEN) || defined(OLIVE)
+ 	if (!early_disabled) {
+ 		sweet_early_band(stage);
+ 	}
+@@ -270,6 +316,12 @@ sweet_early_relocate(uint64_t base)
+ 	early_base = (volatile uint8_t *)(uintptr_t)(base + (uint64_t)TAIMEN_FB_BLOCKS * ARM_TT_L2_SIZE);
+ 	early_kick = (volatile uint32_t *)(uintptr_t)(base + (uint64_t)(TAIMEN_FB_BLOCKS + 1u) * ARM_TT_L2_SIZE + TAIMEN_KICK_OFF);
+ 	early_intr = (volatile uint32_t *)(uintptr_t)(base + (uint64_t)(TAIMEN_FB_BLOCKS + 1u) * ARM_TT_L2_SIZE + TAIMEN_INTR_OFF);
++#elif defined(OLIVE)
++	/* alias layout (arm_vm_init.c): splash blocks, then the log block, then the PS_HOLD block */
++	early_fb = (volatile uint32_t *)(uintptr_t)(base + (OLIVE_FB_PA - OLIVE_SPLASH_PA));
++	early_base = (volatile uint8_t *)(uintptr_t)(base + (uint64_t)OLIVE_SPLASH_BLOCKS * ARM_TT_L2_SIZE);
++	olive_early_pshold = (volatile uint32_t *)(uintptr_t)(base + (uint64_t)(OLIVE_SPLASH_BLOCKS + 1u) * ARM_TT_L2_SIZE +
++	    (OLIVE_PSHOLD_PA & (ARM_TT_L2_SIZE - 1)));
+ #else
+ 	early_base = (volatile uint8_t *)(uintptr_t)base;
+ #endif
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index e8636e6..20fe092 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -10,6 +10,10 @@
+ #if defined(ARM64_BOARD_CONFIG_TAIMEN)
+ void taimen_thread_dump(const char *tag);
+ #endif
++#if defined(ARM64_BOARD_CONFIG_OLIVE)
++/* Kernel VA of PS_HOLD once sweet_early_relocate ran (NULL before): early reset path. */
++extern volatile uint32_t *olive_early_pshold;
++#endif
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ /* Same log, also after sweet_early_disable: the console mirrors into it. */
