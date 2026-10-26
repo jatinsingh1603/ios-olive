@@ -1,0 +1,132 @@
+diff --git a/bsd/kern/ubc_subr.c b/bsd/kern/ubc_subr.c
+index fdb52df..24fd8ce 100644
+--- a/bsd/kern/ubc_subr.c
++++ b/bsd/kern/ubc_subr.c
+@@ -372,7 +372,7 @@ cs_validate_codedirectory(const CS_CodeDirectory *cd, size_t length)
+ 		return EBADEXEC;
+ 	}
+ 	if ((cd->pageSize != PAGE_SHIFT_4K) && (cd->pageSize != PAGE_SHIFT)
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ 	    && (cd->pageSize != 14)	/* iOS 16 dyld shared cache: 16 KiB hash units on a 4 KiB kernel */
+ #endif
+ 	    ) {
+@@ -5924,7 +5924,7 @@ cs_validate_page(
+ 	*tainted_p = VMP_CS_ALL_FALSE;
+ 	*nx_p = VMP_CS_ALL_FALSE;
+ 
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ 	/* Bring-up: 16 KiB-signed cache on 4 KiB VM pages; do not hash past the mapped page. */
+ 	return;
+ #endif
+diff --git a/osfmk/arm/cpuid.c b/osfmk/arm/cpuid.c
+index 82c7417..16afa0e 100644
+--- a/osfmk/arm/cpuid.c
++++ b/osfmk/arm/cpuid.c
+@@ -388,7 +388,7 @@ do_cacheid(void)
+ 		cpuid_cache_info_p->c_inner_cache_size = cpuid_cache_info_p->c_dsize;
+ 		cpuid_cache_info_p->c_bulksize_op = cpuid_cache_info_p->c_dsize;
+ 	}
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ 	/*
+ 	 * Whole-cache set/way operations act on the executing core only; with more than one
+ 	 * core running (0219, docs/taimen-smp-plan.md 5.7) every flush takes the VA-range path,
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index f933843..39387ac 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2551,7 +2551,7 @@ pmap_virtual_region(
+ 		*size = LOW_GLOBAL_BASE_ADDRESS - *startp;
+ 		ret = TRUE;
+ 	}
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ 	if (region_select == 4) {
+ 		/*
+ 		 * taimen: the early framebuffer/log/MDP block aliases (arm_vm_init.c
+diff --git a/osfmk/arm/pmap/pmap.h b/osfmk/arm/pmap/pmap.h
+index afe854a..1688409 100644
+--- a/osfmk/arm/pmap/pmap.h
++++ b/osfmk/arm/pmap/pmap.h
+@@ -111,11 +111,13 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
+-#elif defined(ARM64_BOARD_CONFIG_TAIMEN)
++#elif defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ /*
+  * 4 KiB pages, 1 GiB per L1 entry: RAM from 0xb1000000 to the upper bank's end
+  * (~3.2 GiB) takes 4 L2 tables for V=P and 4 for the kernel's VA, plus the two
+  * L1 tables and start.s's Device block at index 0. 8 pages fit only ~1.5 GiB.
++ * OLIVE: 0xa0000000 + 0x5f400000 crosses 2 L1 entries each way plus the splash
++ * and log runs: 7-8 pages, right at the default; an overrun is silent.
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 20)
+ #else /* defined(ARM_LARGE_MEMORY) */
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 6e7e992..5dd274c 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -2363,7 +2363,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	va_l1 = dynamic_memory_begin;
+ 	va_l1_end = va_l1 + ((2 + (mem_segments * 10)) << 20);
+ 	va_l1_end += round_page(args->Video.v_height * args->Video.v_rowBytes);
+-#if defined(TAIMEN)
++#if defined(TAIMEN) || defined(OLIVE)
+ 	/*
+ 	 * The console maps the framebuffer once (sweet-fbcon reg) and
+ 	 * initialize_screen maps it again (16.6 MB each on the 1440x2880 panel),
+diff --git a/osfmk/kern/zalloc.c b/osfmk/kern/zalloc.c
+index 4d61884..be11c36 100644
+--- a/osfmk/kern/zalloc.c
++++ b/osfmk/kern/zalloc.c
+@@ -160,7 +160,7 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ /* 4 KiB kernel in the compact 39-bit VA layout, MacOSX platform facilities otherwise. */
+ #define ZONE_MAP_MAX            (8ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (24ULL << 30)
+diff --git a/osfmk/mach/arm/vm_param.h b/osfmk/mach/arm/vm_param.h
+index 5edba74..fe2d124 100644
+--- a/osfmk/mach/arm/vm_param.h
++++ b/osfmk/mach/arm/vm_param.h
+@@ -133,7 +133,7 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && !defined(ARM64_BOARD_CONFIG_TAIMEN) && !defined(ARM64_BOARD_CONFIG_OLIVE)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
+diff --git a/osfmk/vm/vm_compressor.c b/osfmk/vm/vm_compressor.c
+index 7e4c229..b61de35 100644
+--- a/osfmk/vm/vm_compressor.c
++++ b/osfmk/vm/vm_compressor.c
+@@ -869,7 +869,7 @@ vm_compressor_set_size(void)
+ 	}
+ 	compressor_pool_multiplier = 1;
+ #endif
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ 	/*
+ 	 * The 4 KiB kernel's compact layout leaves ~45 GiB of kernel VA after the physmap for every
+ 	 * kmem claim. The macOS pool (16 x max_mem) next to the 24 GiB zone map overflows it above
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index 03362c5..543eb10 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -810,7 +810,7 @@ vm_shared_region_create(
+ 		goto done;
+ 	}
+ 
+-#if defined(ARM64_BOARD_CONFIG_TAIMEN)
++#if defined(ARM64_BOARD_CONFIG_TAIMEN) || defined(ARM64_BOARD_CONFIG_OLIVE)
+ 	/* Bring-up: the 16 KiB-signed iOS cache runs on 4 KiB VM pages. */
+ 	vm_map_cs_enforcement_set(sub_map, false);
+ #else
