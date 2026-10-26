@@ -3,7 +3,7 @@
 # and diff the two, without Xcode or a configured build: missing generated/config headers
 # (mach_kdp.h, debug.h, MIG output, ...) are stubbed empty, the same stubs for both configs,
 # so only the board gates can make the outputs differ. #error lines are tolerated (-E keeps going).
-# usage: olive-pp.sh XNU_TREE OUTDIR file.c|file.h ...
+# usage: olive-pp.sh XNU_TREE OUTDIR file.c|file.cpp|file.s|file.h ...
 #   writes OUTDIR/<name>.TAIMEN.i, OUTDIR/<name>.OLIVE.i and prints the diff per file.
 #   For a header, pass a probe .c that includes it and names the macros to expand.
 set -uo pipefail
@@ -17,9 +17,11 @@ F_TAIMEN="-DARM64_BOARD_CONFIG_SWEET -DARM64_BOARD_CONFIG_TAIMEN -mcpu=kryo"
 F_OLIVE="-DARM64_BOARD_CONFIG_SWEET -DARM64_BOARD_CONFIG_OLIVE -mcpu=cortex-a53 -mfix-cortex-a53-835769"
 INC="-I $STUB -I osfmk/libsa -I osfmk -I bsd -I libkern -I iokit -I pexpert -I EXTERNAL_HEADERS -I libsa -I security -I san"
 pp() {	# config src out: stub every missing header until clang -E gets through
-	local i err h
+	local i err h lang=
+	# xnu's .s files are cpp'd (Darwin clang treats .s as assembler-with-cpp); .cpp as C++
+	case "$2" in *.s) lang="-x assembler-with-cpp" ;; *.cpp) lang="-x c++ -std=gnu++2a" ;; esac
 	for i in $(seq 1 300); do
-		err=$(cd "$X" && clang -E $COMMON $(eval echo \$F_$1) $INC "$2" 2>&1 >"$3" | grep -m1 "fatal error: '.*' file not found")
+		err=$(cd "$X" && clang -E $COMMON $(eval echo \$F_$1) $INC $lang "$2" 2>&1 >"$3" | grep -m1 "fatal error: '.*' file not found")
 		[ -z "$err" ] && return 0
 		h=$(echo "$err" | sed -E "s/.*fatal error: '([^']*)'.*/\1/")
 		mkdir -p "$STUB/$(dirname "$h")"; : >"$STUB/$h"
